@@ -2,14 +2,12 @@
 # Medical Appointment & Doctor Finder Assistant
 # Features : Find nearby doctors | Compare hospitals |
 #            Booking guidance | Medicine reminder chat
-# Tools    : Tavily (web search) + Google Places API (location data)
+# Tools    : Tavily web search ONLY
 #=============================================================
 
 import json
 from datetime import datetime
 
-import requests
-import pandas as pd
 import streamlit as st
 import pytesseract
 from PIL import Image
@@ -31,19 +29,21 @@ st.error(
     "doctor. In an emergency, call your local emergency number immediately (India: 112 / 108, US: 911, UK: 999)."
 )
 
+st.info(
+    "ℹ️ All search results below come from live web search (Tavily), not a verified medical "
+    "directory. Details like phone numbers, addresses, and ratings are only as accurate as what "
+    "the source pages say — always confirm directly with the clinic/hospital before relying on them."
+)
+
 # ---------------------------- API KEYS ----------------------------
 st.sidebar.header("🔑 API Keys")
 GOOGLE = st.sidebar.text_input("Gemini API Key", type="password")
 GROQ = st.sidebar.text_input("Groq API Key", type="password")
 TAVILY = st.sidebar.text_input("Tavily API Key", type="password")
-GPLACES = st.sidebar.text_input("Google Places API Key", type="password")
 
 if not TAVILY or not (GOOGLE or GROQ):
     st.sidebar.warning("Enter a Tavily key and at least one LLM key (Gemini or Groq) to continue.")
     st.stop()
-
-if not GPLACES:
-    st.sidebar.info("Add a Google Places API key to enable doctor/hospital search & comparison.")
 
 st.sidebar.success("API keys loaded ✅")
 
@@ -60,31 +60,18 @@ model = load_model(GOOGLE, GROQ)
 
 # ---------------------------- TOOLS ----------------------------
 def search_medical_web(query: str):
-    """Search the web for hospital reviews, doctor credentials, health news, or booking pages using Tavily."""
+    """Search the web for doctors, hospitals, reviews, health news, or booking pages using Tavily."""
     client = TavilyClient(api_key=TAVILY)
-    return client.search(query, max_results=5)
+    return client.search(query, max_results=8, include_answer=False)
 
-def find_nearby_places(query: str):
-    """Find doctors, clinics, or hospitals via Google Places Text Search.
-    query should include the specialty/type and the location, e.g. 'cardiologist in Gurugram'."""
-    if not GPLACES:
-        return {"error": "Google Places API key not provided."}
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    r = requests.get(url, params={"query": query, "key": GPLACES}, timeout=15)
-    return r.json()
-
-def get_place_details(place_id: str):
-    """Get rating, reviews, phone number, hours and website for a specific Google Place ID."""
-    if not GPLACES:
-        return {"error": "Google Places API key not provided."}
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
-    fields = "name,rating,user_ratings_total,formatted_address,formatted_phone_number,opening_hours,website"
-    r = requests.get(url, params={"place_id": place_id, "fields": fields, "key": GPLACES}, timeout=15)
-    return r.json()
+def tavily_raw_search(query: str, max_results: int = 8):
+    """Direct Tavily call used to pre-fetch data before asking the LLM to format it."""
+    client = TavilyClient(api_key=TAVILY)
+    return client.search(query, max_results=max_results, include_answer=False)
 
 agent = create_agent(
     model=model,
-    tools=[search_medical_web, find_nearby_places, get_place_details],
+    tools=[search_medical_web],
 )
 
 SYSTEM_INSTRUCTIONS = """You are a careful, empathetic medical-logistics assistant.
@@ -92,8 +79,10 @@ Rules you must always follow:
 - Never diagnose a condition, never prescribe medicine, never give specific dosage advice.
 - Only give general, publicly-known information about medicines when asked, and always add a
   reminder to confirm with a pharmacist or doctor.
-- When comparing hospitals or doctors, present facts (rating, distance, reviews, services)
-  neutrally — never claim one is medically "better" at treating a condition.
+- When comparing hospitals or doctors, present facts neutrally — never claim one is medically
+  "better" at treating a condition.
+- NEVER invent a phone number, address, or rating that is not present in the provided search data.
+  If a detail is missing, say "Not listed in search results" instead of guessing.
 - When asked for a report, output clean HTML only (no markdown fences, no text outside the HTML).
 - Always end any generated report with a short disclaimer line about consulting a licensed professional.
 """
@@ -128,29 +117,20 @@ with tab1:
         if not city:
             st.warning("Please enter a city or area.")
         else:
-            with st.spinner("Searching nearby providers..."):
-                results = find_nearby_places(f"{specialty} in {city}")
-            places = results.get("results", []) if isinstance(results, dict) else []
-            if not places:
-                st.info("No results found. Check your Google Places API key or try a different search.")
-            else:
-                for p in places[:10]:
-                    with st.container(border=True):
-                        c1, c2 = st.columns([3, 1])
-                        with c1:
-                            st.markdown(f"**{p.get('name', 'Unknown')}**")
-                            st.caption(p.get("formatted_address", ""))
-                            rating = p.get("rating")
-                            total = p.get("user_ratings_total")
-                            if rating:
-                                st.write(f"⭐ {rating} ({total} reviews)")
-                            open_now = p.get("opening_hours", {}).get("open_now")
-                            if open_now is not None:
-                                st.write("🟢 Open now" if open_now else "🔴 Closed now")
-                        with c2:
-                            pid = p.get("place_id")
-                            if pid:
-                                st.link_button("View on Maps", f"https://www.google.com/maps/place/?q=place_id:{pid}")
+            with st.spinner("Searching the web via Tavily..."):
+                raw = tavily_raw_search(f"top {specialty} doctors clinics in {city} contact address reviews")
+                prompt = f"""
+                Here is raw web search data (JSON) about {specialty} providers in {city}:
+                {json.dumps(raw.get("results", []))}
+
+                Generate clean HTML (no markdown) showing up to 8 provider options as cards.
+                For each card include: name, area/address if mentioned in the text, phone if
+                mentioned, a one-line note on what the source says, and a link to the source URL.
+                If a field isn't in the text, write "Not listed in search results" — do not invent it.
+                Use a light, professional color scheme with clear spacing between cards.
+                """
+                html_out = run_agent(prompt)
+            render_html(html_out)
 
 # ======================= TAB 2: COMPARE HOSPITALS =======================
 with tab2:
@@ -163,30 +143,26 @@ with tab2:
         if not city2 or len(names) < 2:
             st.warning("Enter a city and at least 2 hospital names.")
         else:
-            rows = []
-            with st.spinner("Fetching hospital data..."):
+            bundle = {}
+            with st.spinner("Searching the web via Tavily for each hospital..."):
                 for name in names[:4]:
-                    search = find_nearby_places(f"{name} hospital in {city2}")
-                    results = search.get("results", []) if isinstance(search, dict) else []
-                    if not results:
-                        rows.append({"Hospital": name, "Rating": "N/A", "Reviews": "N/A",
-                                      "Address": "Not found", "Phone": "N/A", "Website": "N/A"})
-                        continue
-                    top = results[0]
-                    details = get_place_details(top.get("place_id", ""))
-                    d = details.get("result", {}) if isinstance(details, dict) else {}
-                    rows.append({
-                        "Hospital": d.get("name", name),
-                        "Rating": d.get("rating", "N/A"),
-                        "Reviews": d.get("user_ratings_total", "N/A"),
-                        "Address": d.get("formatted_address", top.get("formatted_address", "N/A")),
-                        "Phone": d.get("formatted_phone_number", "N/A"),
-                        "Website": d.get("website", "N/A"),
-                    })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True)
-            st.caption("Ratings/reviews are pulled live from Google Places and reflect general patient "
-                       "sentiment, not clinical quality.")
+                    res = tavily_raw_search(f"{name} hospital {city2} reviews rating address contact services")
+                    bundle[name] = res.get("results", [])
+
+                prompt = f"""
+                Here is raw web search data (JSON), keyed by hospital name, gathered for a
+                hospital comparison in {city2}:
+                {json.dumps(bundle)}
+
+                Generate a single clean HTML comparison table (no markdown) with one row per
+                hospital and columns: Hospital, Address, Contact, Notable Info (services/reviews
+                mentioned in the text), Source (link to the most relevant URL found). If a field
+                is not present in the text for that hospital, write "Not found in search results" —
+                do not invent details. Use a light, readable color scheme.
+                """
+                html_out = run_agent(prompt)
+            render_html(html_out)
+            st.caption("Details are pulled from live web search snippets, not a verified hospital database.")
 
 # ======================= TAB 3: BOOKING GUIDANCE =======================
 with tab3:
@@ -202,7 +178,9 @@ with tab3:
         else:
             with st.spinner("Preparing guidance..."):
                 prompt = f"""
-                Generate an HTML guide (no markdown) for booking an appointment with:
+                Use web search (the search_medical_web tool) if useful to check how patients
+                typically book with this provider, then generate an HTML guide (no markdown) for
+                booking an appointment with:
                 Provider: {provider_name}
                 City: {city3}
                 Reason for visit (general category): {reason}
