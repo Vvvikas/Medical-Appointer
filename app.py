@@ -45,7 +45,7 @@ st.sidebar.success("API keys loaded ✅")
 def get_model(api_key):
     return ChatGoogleGenerativeAI(
         google_api_key=api_key,
-        model="gemini-2.0-flash",
+        model = 'gemini-3.5-flash-lite',
         temperature=0.4,
     )
 
