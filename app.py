@@ -53,7 +53,7 @@ def load_model(google_key, groq_key):
     # NOTE: model names change over time — verify the current one in your
     # provider's docs (Google AI Studio / Groq console) before deploying.
     if google_key:
-        return ChatGoogleGenerativeAI(google_api_key=google_key, model="gemini-2.5-flash", temperature=0.3)
+        return ChatGoogleGenerativeAI(google_api_key=google_key, model="gemini-3.5-flash", temperature=0.3)
     return ChatGroq(groq_api_key=groq_key, model="llama-3.3-70b-versatile", temperature=0.3)
 
 model = load_model(GOOGLE, GROQ)
