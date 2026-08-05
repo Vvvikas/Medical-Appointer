@@ -1,0 +1,9 @@
+streamlit
+langchain
+langchain-groq
+langchain-google-genai
+tavily-python
+requests
+pandas
+pytesseract
+pillow
