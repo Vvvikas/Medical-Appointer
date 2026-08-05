@@ -1,261 +1,217 @@
 #=============================================================
-# Medical Appointment & Doctor Finder Assistant
-# Features : Find nearby doctors | Compare hospitals |
-#            Booking guidance | Medicine reminder chat
-# Tools    : Tavily web search ONLY
+# MEDICAL APPOINTMENT & DOCTOR FINDER ASSISTANT
+# Streamlit + LangChain agent (Gemini) + Tavily web search
+#
+# Features:
+#   1. Find nearby doctors
+#   2. Compare hospitals
+#   3. Booking guidance
+#   4. Medicine reminder chat
 #=============================================================
 
-import json
-from datetime import datetime
-
 import streamlit as st
-import pytesseract
-from PIL import Image
-import streamlit.components.v1 as components
-
 from langchain.agents import create_agent
-from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
 from tavily import TavilyClient
 
 st.set_page_config(page_title="Medical Appointment & Doctor Finder Assistant", layout="wide")
 
 st.title("🩺 Medical Appointment & Doctor Finder Assistant")
-st.caption("Find nearby doctors, compare hospitals, get booking guidance, and track medicine reminders.")
+st.caption("Find doctors, compare hospitals, get booking guidance, and manage medicine reminders.")
 
-st.error(
-    "⚠️ **Not medical advice.** This assistant helps with logistics only (finding providers, "
-    "comparing facilities, booking steps). It does not diagnose, prescribe, or replace a licensed "
-    "doctor. In an emergency, call your local emergency number immediately (India: 112 / 108, US: 911, UK: 999)."
+st.warning(
+    "⚠️ This tool provides general information only and is **not** a substitute for "
+    "professional medical advice, diagnosis, or treatment. Always verify details directly "
+    "with the clinic/hospital, and consult a licensed doctor or pharmacist for medical decisions, "
+    "dosages, or emergencies."
 )
 
-st.info(
-    "ℹ️ All search results below come from live web search (Tavily), not a verified medical "
-    "directory. Details like phone numbers, addresses, and ratings are only as accurate as what "
-    "the source pages say — always confirm directly with the clinic/hospital before relying on them."
-)
+# ---------------- API KEYS ----------------
+with st.sidebar:
+    st.header("🔑 API Keys")
+    GOOGLE_API_KEY = st.text_input("Gemini API Key", type="password")
+    TAVILY_API_KEY = st.text_input("Tavily API Key", type="password")
+    st.divider()
 
-# ---------------------------- API KEYS ----------------------------
-st.sidebar.header("🔑 API Keys")
-GOOGLE = st.sidebar.text_input("Gemini API Key", type="password")
-GROQ = st.sidebar.text_input("Groq API Key", type="password")
-TAVILY = st.sidebar.text_input("Tavily API Key", type="password")
-
-if not TAVILY or not (GOOGLE or GROQ):
-    st.sidebar.warning("Enter a Tavily key and at least one LLM key (Gemini or Groq) to continue.")
+if not GOOGLE_API_KEY or not TAVILY_API_KEY:
+    st.sidebar.warning("Please enter both API keys to continue.")
     st.stop()
 
 st.sidebar.success("API keys loaded ✅")
 
-# ---------------------------- MODEL ----------------------------
-@st.cache_resource(show_spinner=False)
-def load_model(google_key, groq_key):
-    # NOTE: model names change over time — verify the current one in your
-    # provider's docs (Google AI Studio / Groq console) before deploying.
-    if google_key:
-        return ChatGoogleGenerativeAI(google_api_key=google_key, model="gemini-3.5-flash", temperature=0.3)
-    return ChatGroq(groq_api_key=groq_key, model="llama-3.3-70b-versatile", temperature=0.3)
+# ---------------- MODEL & TOOLS ----------------
+@st.cache_resource
+def get_model(api_key):
+    return ChatGoogleGenerativeAI(
+        google_api_key=api_key,
+        model="gemini-2.0-flash",
+        temperature=0.4,
+    )
 
-model = load_model(GOOGLE, GROQ)
+model = get_model(GOOGLE_API_KEY)
 
-# ---------------------------- TOOLS ----------------------------
-def search_medical_web(query: str):
-    """Search the web for doctors, hospitals, reviews, health news, or booking pages using Tavily."""
-    client = TavilyClient(api_key=TAVILY)
-    return client.search(query, max_results=8, include_answer=False)
 
-def tavily_raw_search(query: str, max_results: int = 8):
-    """Direct Tavily call used to pre-fetch data before asking the LLM to format it."""
-    client = TavilyClient(api_key=TAVILY)
-    return client.search(query, max_results=max_results, include_answer=False)
+def search_web(query: str):
+    """Search the web for doctors, hospitals, clinics, or medical facility information near a location."""
+    client = TavilyClient(api_key=TAVILY_API_KEY)
+    return client.search(query, max_results=8)
 
-agent = create_agent(
-    model=model,
-    tools=[search_medical_web],
-)
 
-SYSTEM_INSTRUCTIONS = """You are a careful, empathetic medical-logistics assistant.
-Rules you must always follow:
-- Never diagnose a condition, never prescribe medicine, never give specific dosage advice.
-- Only give general, publicly-known information about medicines when asked, and always add a
-  reminder to confirm with a pharmacist or doctor.
-- When comparing hospitals or doctors, present facts neutrally — never claim one is medically
-  "better" at treating a condition.
-- NEVER invent a phone number, address, or rating that is not present in the provided search data.
-  If a detail is missing, say "Not listed in search results" instead of guessing.
-- When asked for a report, output clean HTML only (no markdown fences, no text outside the HTML).
-- Always end any generated report with a short disclaimer line about consulting a licensed professional.
-"""
+agent = create_agent(model=model, tools=[search_web])
 
-def run_agent(user_prompt: str) -> str:
-    full_prompt = SYSTEM_INSTRUCTIONS + "\n\nTASK:\n" + user_prompt
-    response = agent.invoke({"messages": [{"role": "user", "content": full_prompt}]})
-    return response["messages"][-1].content[-1]["text"]
 
-def render_html(html_code: str, height: int = 650):
-    components.html(html_code, height=height, scrolling=True)
+def run_agent(prompt: str) -> str:
+    """Send a prompt to the agent and safely extract the text reply, regardless of content shape."""
+    try:
+        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+        msg = response["messages"][-1]
+        content = msg.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("text")]
+            if texts:
+                return "\n".join(texts)
+        return str(content)
+    except Exception as e:
+        return f"⚠️ Something went wrong while contacting the assistant: {e}"
 
-# ---------------------------- TABS ----------------------------
+
+# ---------------- STATIC OPTIONS ----------------
+CITIES = [
+    "Delhi", "Noida", "Gurgaon/Gurugram", "Kanpur", "Lucknow",
+    "Bangalore", "Pune", "Mumbai", "Chennai", "Hyderabad",
+]
+
+SPECIALTIES = [
+    "General Physician", "Cardiologist", "Dermatologist", "Orthopedic",
+    "Pediatrician", "Gynecologist", "Dentist", "ENT Specialist",
+    "Neurologist", "Psychiatrist", "Ophthalmologist",
+]
+
 tab1, tab2, tab3, tab4 = st.tabs(
-    ["🔎 Find Doctors", "🏥 Compare Hospitals", "📋 Booking Guidance", "💊 Medicine Reminders"]
+    ["🔍 Find Doctors", "🏥 Compare Hospitals", "📅 Booking Guidance", "💊 Medicine Reminder Chat"]
 )
 
-# ======================= TAB 1: FIND DOCTORS =======================
+# ---------------- TAB 1: FIND DOCTORS ----------------
 with tab1:
-    st.subheader("Find nearby doctors, clinics, or hospitals")
+    st.subheader("Find Nearby Doctors")
     col1, col2 = st.columns(2)
     with col1:
-        specialty = st.selectbox(
-            "Specialty",
-            ["General Physician", "Cardiologist", "Dermatologist", "Dentist", "Pediatrician",
-             "Orthopedic", "Gynecologist", "ENT Specialist", "Psychiatrist", "Neurologist", "Ophthalmologist"],
-        )
+        city = st.selectbox("City / Area", CITIES, key="doc_city")
     with col2:
-        city = st.text_input("City / Area", placeholder="e.g. Gurugram, Haryana")
+        specialty = st.selectbox("Specialty", SPECIALTIES, key="doc_specialty")
 
-    if st.button("Search Doctors", key="search_doctors"):
-        if not city:
-            st.warning("Please enter a city or area.")
-        else:
-            with st.spinner("Searching the web via Tavily..."):
-                raw = tavily_raw_search(f"top {specialty} doctors clinics in {city} contact address reviews")
-                prompt = f"""
-                Here is raw web search data (JSON) about {specialty} providers in {city}:
-                {json.dumps(raw.get("results", []))}
+    if st.button("Search Doctors"):
+        with st.spinner("Searching for doctors..."):
+            search_prompt = f"""
+            Use the search tool to find real, currently practicing {specialty} doctors or clinics
+            in {city}, India (e.g. via hospital sites, Practo, Justdial-type listings).
+            Return the result as clean HTML (no markdown fences, no explanations outside the HTML)
+            styled as a responsive card grid. Each card should show: doctor/clinic name, specialty,
+            area/address, approximate consultation fee if found, and a link if available.
+            If exact data isn't found, clearly state that fewer results were available instead of
+            inventing details, and never fabricate phone numbers.
+            """
+            st.session_state["doctor_results"] = run_agent(search_prompt)
 
-                Generate clean HTML (no markdown) showing up to 8 provider options as cards.
-                For each card include: name, area/address if mentioned in the text, phone if
-                mentioned, a one-line note on what the source says, and a link to the source URL.
-                If a field isn't in the text, write "Not listed in search results" — do not invent it.
-                Use a light, professional color scheme with clear spacing between cards.
-                """
-                html_out = run_agent(prompt)
-            render_html(html_out)
+    if "doctor_results" in st.session_state:
+        st.components.v1.html(st.session_state["doctor_results"], height=600, scrolling=True)
 
-# ======================= TAB 2: COMPARE HOSPITALS =======================
+# ---------------- TAB 2: COMPARE HOSPITALS ----------------
 with tab2:
-    st.subheader("Compare hospitals side by side")
-    city2 = st.text_input("City / Area", key="compare_city", placeholder="e.g. Noida")
-    hospitals_raw = st.text_input("Hospital names (comma separated, 2-4)", placeholder="Fortis, Max, Apollo")
+    st.subheader("Compare Hospitals")
+    city2 = st.selectbox("City / Area", CITIES, key="hosp_city")
+    hospital_names = st.text_input(
+        "Enter 2–4 hospital names to compare (comma separated), or leave blank for top hospitals in the city"
+    )
 
-    if st.button("Compare", key="compare_btn"):
-        names = [n.strip() for n in hospitals_raw.split(",") if n.strip()]
-        if not city2 or len(names) < 2:
-            st.warning("Enter a city and at least 2 hospital names.")
-        else:
-            bundle = {}
-            with st.spinner("Searching the web via Tavily for each hospital..."):
-                for name in names[:4]:
-                    res = tavily_raw_search(f"{name} hospital {city2} reviews rating address contact services")
-                    bundle[name] = res.get("results", [])
+    if st.button("Compare Hospitals"):
+        with st.spinner("Gathering hospital details..."):
+            target = (
+                f"the following hospitals: {hospital_names}"
+                if hospital_names.strip()
+                else f"the top rated hospitals in {city2}, India"
+            )
+            compare_prompt = f"""
+            Use the search tool to find information about {target}.
+            Present a comparison as a single clean HTML table (no markdown fences) with columns:
+            Hospital Name, Location, Key Specialties, Approx. Rating, Emergency Services (Y/N),
+            Notable Facilities, Website/Link.
+            If information is unavailable for a field, write "Not available" rather than guessing.
+            """
+            st.session_state["hospital_results"] = run_agent(compare_prompt)
 
-                prompt = f"""
-                Here is raw web search data (JSON), keyed by hospital name, gathered for a
-                hospital comparison in {city2}:
-                {json.dumps(bundle)}
+    if "hospital_results" in st.session_state:
+        st.components.v1.html(st.session_state["hospital_results"], height=500, scrolling=True)
 
-                Generate a single clean HTML comparison table (no markdown) with one row per
-                hospital and columns: Hospital, Address, Contact, Notable Info (services/reviews
-                mentioned in the text), Source (link to the most relevant URL found). If a field
-                is not present in the text for that hospital, write "Not found in search results" —
-                do not invent details. Use a light, readable color scheme.
-                """
-                html_out = run_agent(prompt)
-            render_html(html_out)
-            st.caption("Details are pulled from live web search snippets, not a verified hospital database.")
-
-# ======================= TAB 3: BOOKING GUIDANCE =======================
+# ---------------- TAB 3: BOOKING GUIDANCE ----------------
 with tab3:
-    st.subheader("Get step-by-step booking guidance")
-    provider_name = st.text_input("Doctor / Hospital name")
-    city3 = st.text_input("City", key="booking_city")
-    reason = st.text_area("Reason for visit (general category only, e.g. 'routine checkup', 'skin rash')")
-    insurance = st.selectbox("Do you have health insurance / a TPA card?", ["Not sure", "Yes", "No"])
+    st.subheader("Appointment Booking Guidance")
+    doc_or_hospital = st.text_input("Doctor or Hospital name (optional)")
+    reason = st.text_area("Briefly describe the reason for your visit (optional)")
+    insurance = st.radio("Do you have health insurance?", ["Yes", "No", "Not sure"], horizontal=True)
 
     if st.button("Get Booking Guidance"):
-        if not provider_name:
-            st.warning("Please enter a doctor or hospital name.")
-        else:
-            with st.spinner("Preparing guidance..."):
-                prompt = f"""
-                Use web search (the search_medical_web tool) if useful to check how patients
-                typically book with this provider, then generate an HTML guide (no markdown) for
-                booking an appointment with:
-                Provider: {provider_name}
-                City: {city3}
-                Reason for visit (general category): {reason}
-                Insurance status: {insurance}
+        with st.spinner("Preparing guidance..."):
+            guidance_prompt = f"""
+            Give general, practical step-by-step guidance (as clean HTML, no markdown fences) for booking
+            a medical appointment {"at/with " + doc_or_hospital if doc_or_hospital else "with a suitable doctor"}
+            in India.
+            Visit reason (if any): {reason if reason else "not specified"}.
+            Insurance status: {insurance}.
+            Include: how to book (phone/app/walk-in), documents to carry (ID, prior reports, insurance card),
+            what to expect at check-in, typical wait times, and questions to ask the receptionist.
+            This must stay administrative/logistics guidance only — do not give medical diagnoses,
+            treatment advice, or medication advice.
+            End with a short note to confirm final details directly with the clinic/hospital.
+            """
+            st.session_state["booking_guidance"] = run_agent(guidance_prompt)
 
-                Include: how to find their contact number/booking page, what to ask the receptionist,
-                documents to bring (ID, insurance card, prior reports), whether telemedicine may be an
-                option, and a simple checklist. Use headings, a checklist styled as a list, and a light
-                color scheme. End with a one-line disclaimer to consult a licensed doctor.
-                """
-                html_out = run_agent(prompt)
-            render_html(html_out)
+    if "booking_guidance" in st.session_state:
+        st.components.v1.html(st.session_state["booking_guidance"], height=550, scrolling=True)
 
-# ======================= TAB 4: MEDICINE REMINDERS =======================
+# ---------------- TAB 4: MEDICINE REMINDER CHAT ----------------
 with tab4:
     st.subheader("Medicine Reminder Chat")
     st.caption(
-        "⚠️ Streamlit apps don't run in the background, so this can't send push notifications like a "
-        "phone app. Use it as a running log/checklist — set your phone's own alarm for the actual time."
+        "Tell me your medicines and when you take them, and I'll help you organize a reminder schedule. "
+        "I can't advise on dosages, interactions, or whether a medicine is right for you — please check "
+        "with your doctor or pharmacist for that."
     )
 
-    if "reminders" not in st.session_state:
-        st.session_state.reminders = []
+    if "med_chat" not in st.session_state:
+        st.session_state["med_chat"] = []
 
-    st.markdown("**Add a reminder by describing it in plain language:**")
-    chat_input = st.text_input("e.g. 'Paracetamol 500mg, twice daily, 9am and 9pm'", key="reminder_chat")
-    add_clicked = st.button("Add Reminder")
+    for role, text in st.session_state["med_chat"]:
+        with st.chat_message(role):
+            st.markdown(text)
 
-    if add_clicked and chat_input:
-        with st.spinner("Parsing reminder..."):
-            parse_prompt = f"""
-            Extract structured medicine reminder data from this text: "{chat_input}"
-            Respond with ONLY a JSON object, no markdown fences, no extra text, with keys:
-            medicine (string), dosage (string), times (array of strings like "09:00"), frequency (string).
-            If something is unclear, make a reasonable simple assumption.
-            """
-            raw = run_agent(parse_prompt)
-        try:
-            clean = raw.strip().strip("`")
-            if clean.lower().startswith("json"):
-                clean = clean[4:].strip()
-            data = json.loads(clean)
-            data["added_on"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            st.session_state.reminders.append(data)
-            st.success(f"Added reminder for {data.get('medicine', 'medicine')}")
-        except Exception:
-            st.error("Couldn't parse that reminder — try rephrasing, e.g. 'Metformin 500mg every morning at 8am'.")
+    user_msg = st.chat_input("e.g. I take Metformin at 8am and 8pm, and Vitamin D once a week on Sunday")
 
-    st.divider()
-    st.markdown("**Or upload a prescription photo to extract medicine names (OCR):**")
-    presc_file = st.file_uploader("Prescription image", type=["jpg", "jpeg", "png"], key="presc_upload")
-    if presc_file is not None:
-        try:
-            img = Image.open(presc_file)
-            st.image(img, caption="Uploaded prescription", width=300)
-            extracted_text = pytesseract.image_to_string(img)
-            st.text_area(
-                "Extracted text (OCR) — review before trusting it, OCR can misread handwriting",
-                value=extracted_text, height=150,
-            )
-        except Exception as e:
-            st.error(f"Could not process image (is tesseract-ocr installed on the server? see packages.txt): {e}")
+    if user_msg:
+        st.session_state["med_chat"].append(("user", user_msg))
+        with st.chat_message("user"):
+            st.markdown(user_msg)
 
-    st.divider()
-    st.markdown("**Your reminders:**")
-    if not st.session_state.reminders:
-        st.info("No reminders added yet.")
-    else:
-        for i, r in enumerate(st.session_state.reminders):
-            with st.container(border=True):
-                c1, c2 = st.columns([4, 1])
-                with c1:
-                    st.write(f"💊 **{r.get('medicine', '?')}** — {r.get('dosage', '?')}")
-                    st.caption(f"Times: {', '.join(r.get('times', []))} | Frequency: {r.get('frequency', '?')}")
-                with c2:
-                    if st.button("Remove", key=f"remove_{i}"):
-                        st.session_state.reminders.pop(i)
-                        st.rerun()
+        history_text = "\n".join(f"{r}: {t}" for r, t in st.session_state["med_chat"][-10:])
+        reminder_prompt = f"""
+        You are a medicine reminder organizer assistant, not a doctor or pharmacist.
+        Conversation so far:
+        {history_text}
+
+        Based on what the user has told you, help them organize a clear reminder schedule
+        (e.g. a simple table of medicine name, time, frequency). Ask clarifying questions if
+        timings are unclear or missing. Do NOT suggest dosages, dosage changes, drug combinations,
+        or whether a medicine is appropriate for them — if asked about that, gently redirect the
+        user to a doctor or pharmacist instead of answering. Keep the reply conversational
+        (plain markdown, not HTML) and concise.
+        """
+        reply = run_agent(reminder_prompt)
+        st.session_state["med_chat"].append(("assistant", reply))
+        with st.chat_message("assistant"):
+            st.markdown(reply)
+
+    if st.session_state["med_chat"] and st.button("Clear Chat"):
+        st.session_state["med_chat"] = []
+        st.rerun()
