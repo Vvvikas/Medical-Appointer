@@ -9,9 +9,10 @@
 #   4. Medicine reminder chat
 #=============================================================
 
+import hashlib
 import streamlit as st
-from langchain.agents import create_agent
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.messages import SystemMessage, HumanMessage
 from tavily import TavilyClient
 
 st.set_page_config(page_title="Medical Appointment & Doctor Finder Assistant", layout="wide")
@@ -39,7 +40,7 @@ if not GOOGLE_API_KEY or not TAVILY_API_KEY:
 
 st.sidebar.success("API keys loaded ✅")
 
-# ---------------- MODEL & TOOLS ----------------
+# ---------------- MODEL ----------------
 @st.cache_resource
 def get_model(api_key):
     return ChatGoogleGenerativeAI(
@@ -50,31 +51,77 @@ def get_model(api_key):
 
 model = get_model(GOOGLE_API_KEY)
 
-
-def search_web(query: str):
-    """Search the web for doctors, hospitals, clinics, or medical facility information near a location."""
-    client = TavilyClient(api_key=TAVILY_API_KEY)
-    return client.search(query, max_results=8)
-
-
-agent = create_agent(model=model, tools=[search_web])
+# A friendly, reusable message for quota/rate-limit errors so users understand what happened
+QUOTA_HINT = (
+    "⚠️ The API key hit a rate limit or quota error. This usually means too many requests "
+    "were sent in a short window, or the free-tier daily limit was reached. Wait a bit and "
+    "try again, or use a key with a higher quota."
+)
 
 
-def run_agent(prompt: str) -> str:
-    """Send a prompt to the agent and safely extract the text reply, regardless of content shape."""
+def _is_quota_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(term in msg for term in ["quota", "rate limit", "429", "resource_exhausted"])
+
+
+# ---------------- SEARCH (1 call, cached) ----------------
+# Cached by (hash of tavily key, query, max_results) so re-running the script (Streamlit reruns
+# on every widget interaction) or re-clicking with the same inputs does NOT fire a new API call.
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_search(tavily_key_hash: str, query: str, max_results: int = 5):
+    client = TavilyClient(api_key=st.session_state["_tavily_key"])
+    return client.search(query, max_results=max_results)
+
+
+def search_once(query: str, max_results: int = 5):
+    """Exactly ONE Tavily call per unique query (cached across reruns)."""
+    st.session_state["_tavily_key"] = TAVILY_API_KEY  # stash so the cached fn can read it
+    key_hash = hashlib.sha256(TAVILY_API_KEY.encode()).hexdigest()[:12]
     try:
-        response = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
-        msg = response["messages"][-1]
-        content = msg.content
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("text")]
-            if texts:
-                return "\n".join(texts)
-        return str(content)
+        return cached_search(key_hash, query, max_results)
     except Exception as e:
+        if _is_quota_error(e):
+            return {"error": QUOTA_HINT}
+        return {"error": f"⚠️ Search failed: {e}"}
+
+
+# ---------------- FORMAT (1 LLM call, cached, no agent loop) ----------------
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_format(gemini_key_hash: str, system_text: str, user_text: str) -> str:
+    messages = [SystemMessage(content=system_text), HumanMessage(content=user_text)]
+    response = model.invoke(messages)
+    content = response.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("text")]
+        if texts:
+            return "\n".join(texts)
+    return str(content)
+
+
+def format_once(system_text: str, user_text: str) -> str:
+    """Exactly ONE Gemini call — a plain completion, never an autonomous multi-step agent."""
+    key_hash = hashlib.sha256(GOOGLE_API_KEY.encode()).hexdigest()[:12]
+    try:
+        return cached_format(key_hash, system_text, user_text)
+    except Exception as e:
+        if _is_quota_error(e):
+            return QUOTA_HINT
         return f"⚠️ Something went wrong while contacting the assistant: {e}"
+
+
+def search_and_format(query: str, format_instructions: str, max_results: int = 5) -> str:
+    """The whole pipeline: 1 Tavily search + 1 Gemini formatting call. No hidden retries or loops."""
+    results = search_once(query, max_results=max_results)
+    if isinstance(results, dict) and results.get("error"):
+        return results["error"]
+    system_text = (
+        "You turn raw web search results into clean, honest HTML output. "
+        "Never invent facts not present in the results; say 'Not available' instead of guessing."
+    )
+    user_text = f"{format_instructions}\n\nSearch results (JSON):\n{results}"
+    return format_once(system_text, user_text)
 
 
 # ---------------- STATIC OPTIONS ----------------
@@ -104,16 +151,15 @@ with tab1:
 
     if st.button("Search Doctors"):
         with st.spinner("Searching for doctors..."):
-            search_prompt = f"""
-            Use the search tool to find real, currently practicing {specialty} doctors or clinics
-            in {city}, India (e.g. via hospital sites, Practo, Justdial-type listings).
+            query = f"{specialty} doctors clinics in {city} India"
+            instructions = f"""
+            These are search results for {specialty} doctors/clinics in {city}, India.
             Return the result as clean HTML (no markdown fences, no explanations outside the HTML)
             styled as a responsive card grid. Each card should show: doctor/clinic name, specialty,
             area/address, approximate consultation fee if found, and a link if available.
-            If exact data isn't found, clearly state that fewer results were available instead of
-            inventing details, and never fabricate phone numbers.
+            Never fabricate phone numbers.
             """
-            st.session_state["doctor_results"] = run_agent(search_prompt)
+            st.session_state["doctor_results"] = search_and_format(query, instructions)
 
     if "doctor_results" in st.session_state:
         st.components.v1.html(st.session_state["doctor_results"], height=600, scrolling=True)
@@ -128,19 +174,20 @@ with tab2:
 
     if st.button("Compare Hospitals"):
         with st.spinner("Gathering hospital details..."):
-            target = (
-                f"the following hospitals: {hospital_names}"
-                if hospital_names.strip()
-                else f"the top rated hospitals in {city2}, India"
-            )
-            compare_prompt = f"""
-            Use the search tool to find information about {target}.
+            if hospital_names.strip():
+                query = f"{hospital_names} hospital India ratings specialties"
+                target_desc = f"the following hospitals: {hospital_names}"
+            else:
+                query = f"top rated hospitals in {city2} India"
+                target_desc = f"the top rated hospitals in {city2}, India"
+            instructions = f"""
+            These are search results about {target_desc}.
             Present a comparison as a single clean HTML table (no markdown fences) with columns:
             Hospital Name, Location, Key Specialties, Approx. Rating, Emergency Services (Y/N),
             Notable Facilities, Website/Link.
             If information is unavailable for a field, write "Not available" rather than guessing.
             """
-            st.session_state["hospital_results"] = run_agent(compare_prompt)
+            st.session_state["hospital_results"] = search_and_format(query, instructions)
 
     if "hospital_results" in st.session_state:
         st.components.v1.html(st.session_state["hospital_results"], height=500, scrolling=True)
@@ -154,19 +201,24 @@ with tab3:
 
     if st.button("Get Booking Guidance"):
         with st.spinner("Preparing guidance..."):
-            guidance_prompt = f"""
-            Give general, practical step-by-step guidance (as clean HTML, no markdown fences) for booking
+            # General logistics advice doesn't need a web search - this is a single LLM call,
+            # which keeps quota usage minimal (0 Tavily calls, 1 Gemini call).
+            system_text = (
+                "You give general, practical, administrative guidance about booking medical "
+                "appointments in India. You never give medical diagnoses, treatment advice, or "
+                "medication advice - only logistics."
+            )
+            user_text = f"""
+            Give step-by-step guidance (as clean HTML, no markdown fences) for booking
             a medical appointment {"at/with " + doc_or_hospital if doc_or_hospital else "with a suitable doctor"}
             in India.
             Visit reason (if any): {reason if reason else "not specified"}.
             Insurance status: {insurance}.
             Include: how to book (phone/app/walk-in), documents to carry (ID, prior reports, insurance card),
             what to expect at check-in, typical wait times, and questions to ask the receptionist.
-            This must stay administrative/logistics guidance only — do not give medical diagnoses,
-            treatment advice, or medication advice.
             End with a short note to confirm final details directly with the clinic/hospital.
             """
-            st.session_state["booking_guidance"] = run_agent(guidance_prompt)
+            st.session_state["booking_guidance"] = format_once(system_text, user_text)
 
     if "booking_guidance" in st.session_state:
         st.components.v1.html(st.session_state["booking_guidance"], height=550, scrolling=True)
@@ -195,19 +247,23 @@ with tab4:
             st.markdown(user_msg)
 
         history_text = "\n".join(f"{r}: {t}" for r, t in st.session_state["med_chat"][-10:])
-        reminder_prompt = f"""
-        You are a medicine reminder organizer assistant, not a doctor or pharmacist.
+        system_text = (
+            "You are a medicine reminder organizer assistant, not a doctor or pharmacist. "
+            "You help organize reminder schedules only. You never suggest dosages, dosage "
+            "changes, or drug combinations, and never judge whether a medicine is appropriate - "
+            "redirect those questions to a doctor or pharmacist instead of answering them."
+        )
+        user_text = f"""
         Conversation so far:
         {history_text}
 
         Based on what the user has told you, help them organize a clear reminder schedule
         (e.g. a simple table of medicine name, time, frequency). Ask clarifying questions if
-        timings are unclear or missing. Do NOT suggest dosages, dosage changes, drug combinations,
-        or whether a medicine is appropriate for them — if asked about that, gently redirect the
-        user to a doctor or pharmacist instead of answering. Keep the reply conversational
-        (plain markdown, not HTML) and concise.
+        timings are unclear or missing. Keep the reply conversational (plain markdown, not HTML)
+        and concise.
         """
-        reply = run_agent(reminder_prompt)
+        # A single, direct completion call - no autonomous agent loop, no hidden retries.
+        reply = format_once(system_text, user_text)
         st.session_state["med_chat"].append(("assistant", reply))
         with st.chat_message("assistant"):
             st.markdown(reply)
